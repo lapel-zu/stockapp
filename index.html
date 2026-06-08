@@ -1096,11 +1096,13 @@ const EAN13 = (() => {
   }
 
   // VideoFrameをCanvas経由でデコード（getUserMedia用）
-  // ctx: CanvasRenderingContext2D, w/h: canvas サイズ
   function decodeFrame(ctx, w, h) {
-    // 照準枠の中央30%の横帯のみ走査（速度とノイズ耐性のトレードオフ）
-    const scanRows = [0.5, 0.47, 0.53, 0.44, 0.56].map(r => Math.round(h * r));
-    for (const row of scanRows) {
+    // 映像中央40%を密に走査（上下に広めにとってバーコードを捉えやすくする）
+    const rows = [];
+    for (let p = 0.35; p <= 0.65; p += 0.03) rows.push(Math.round(h * p));
+
+    const candidates = new Map();
+    for (const row of rows) {
       if (row < 0 || row >= h) continue;
       const d = ctx.getImageData(0, row, w, 1).data;
       const gray = new Uint8Array(w);
@@ -1108,9 +1110,14 @@ const EAN13 = (() => {
         gray[x] = (d[x*4]*77 + d[x*4+1]*150 + d[x*4+2]*29) >> 8;
       }
       const r = decode(gray, w);
-      if (r) return r;
+      if (r) {
+        const cnt = (candidates.get(r) || 0) + 1;
+        candidates.set(r, cnt);
+        if (cnt >= 2) return r; // 2行一致で確定（誤読防止）
+      }
     }
-    return null;
+    // 2行一致なしでも1件あれば採用
+    return candidates.size === 1 ? [...candidates.keys()][0] : null;
   }
 
   return { decodeFrame };
@@ -1227,26 +1234,29 @@ async function _openCamera() {
   _rafId = requestAnimationFrame(() => _scanLoop(video));
 }
 
+let _lastScanTime = 0;
+
 function _scanLoop(video) {
-  // stopScan済みなら即終了（nullチェック）
   if (!isScanning || !_scanCtx || !_scanCanvas) return;
 
-  _scanCtx.drawImage(video, 0, 0, _scanCanvas.width, _scanCanvas.height);
-  const barcode = EAN13.decodeFrame(_scanCtx, _scanCanvas.width, _scanCanvas.height);
+  const now = performance.now();
+  if (now - _lastScanTime >= 150) { // 150ms間隔でデコード（約6fps）
+    _lastScanTime = now;
+    _scanCtx.drawImage(video, 0, 0, _scanCanvas.width, _scanCanvas.height);
+    const barcode = EAN13.decodeFrame(_scanCtx, _scanCanvas.width, _scanCanvas.height);
 
-  if (barcode) {
-    console.log('スキャン成功:', barcode);
-    // 先にループを止めてからAPI呼び出し
-    cancelAnimationFrame(_rafId); _rafId = null;
-    if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
-    const video2 = document.getElementById('scan-video');
-    if (video2) video2.srcObject = null;
-    _scanCanvas = null; _scanCtx = null;
-    isScanning = false;
-
-    document.getElementById('scan-status').textContent = '商品情報を確認中…';
-    handleBarcodeResult(barcode, scanEventType);
-    return;
+    if (barcode) {
+      console.log('スキャン成功:', barcode);
+      cancelAnimationFrame(_rafId); _rafId = null;
+      if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
+      const video2 = document.getElementById('scan-video');
+      if (video2) video2.srcObject = null;
+      _scanCanvas = null; _scanCtx = null;
+      isScanning = false;
+      document.getElementById('scan-status').textContent = '商品情報を確認中…';
+      handleBarcodeResult(barcode, scanEventType);
+      return;
+    }
   }
 
   _rafId = requestAnimationFrame(() => _scanLoop(video));
