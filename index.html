@@ -948,264 +948,20 @@ function guessPlace(category) {
   return placeMap[category] || 'その他';
 }
 
-// ── 軽量EAN-13 / JAN-13 デコーダー（ZXing不要・Canvas方式） ──
-// バグ修正v2:
-//   - 適応的閾値（Otsu法）で照明むらに対応
-//   - ユニット幅をスタートガード+右半部全体から再推定して精度向上
-//   - 複数行の多数決でデコード結果を確定（誤読防止）
-
-const EAN13 = (() => {
-  const L = ['0001101','0011001','0010011','0111101','0100011','0110001','0101111','0111011','0110111','0001011'];
-  const G = ['0100111','0110011','0011011','0100001','0011101','0111001','0000101','0010001','0001001','0010111'];
-  const R = ['1110010','1100110','1101100','1000010','1011100','1001110','1010000','1000100','1001000','1110100'];
-  const FIRST = ['LLLLLL','LLGLGG','LLGGLG','LLGGGL','LGLLGG','LGGLLG','LGGGLL','LGLGLG','LGLGGL','LGGLGL'];
-
-  // Otsu法による適応的二値化閾値算出
-  function otsuThreshold(gray) {
-    const hist = new Int32Array(256);
-    for (const v of gray) hist[v]++;
-    const total = gray.length;
-    let sum = 0;
-    for (let i = 0; i < 256; i++) sum += i * hist[i];
-    let sumB = 0, wB = 0, max = 0, thr = 128;
-    for (let t = 0; t < 256; t++) {
-      wB += hist[t];
-      if (!wB) continue;
-      const wF = total - wB;
-      if (!wF) break;
-      sumB += t * hist[t];
-      const mB = sumB / wB;
-      const mF = (sum - sumB) / wF;
-      const between = wB * wF * (mB - mF) * (mB - mF);
-      if (between > max) { max = between; thr = t; }
-    }
-    return thr;
-  }
-
-  function decode(gray, width) {
-    const thr = otsuThreshold(gray);
-
-    // 二値化（バー=1, スペース=0）
-    const bits = new Uint8Array(width);
-    for (let x = 0; x < width; x++) bits[x] = gray[x] <= thr ? 1 : 0;
-
-    // ラン長エンコード
-    const runs = [];
-    let cur = bits[0], cnt = 1;
-    for (let x = 1; x < width; x++) {
-      if (bits[x] === cur) { cnt++; }
-      else { runs.push([cur, cnt]); cur = bits[x]; cnt = 1; }
-    }
-    runs.push([cur, cnt]);
-
-    // スタートガード(bar-space-bar = 1-0-1)を探す
-    for (let i = 0; i < runs.length - 58; i++) {
-      if (runs[i][0] !== 1) continue;
-
-      // スタートガード3本からユニット幅の初期推定
-      const uGuard = (runs[i][1] + runs[i+1][1] + runs[i+2][1]) / 3;
-      if (uGuard < 1) continue;
-
-      // runs → 7ビット変換（ユニット幅 u を使用）
-      function runGroupTo7bit(start, u) {
-        let s = '';
-        for (let j = 0; j < 4; j++) {
-          if (start + j >= runs.length) return null;
-          const [color, w] = runs[start + j];
-          const q = Math.max(1, Math.round(w / u));
-          if (q > 4) return null;
-          s += (color ? '1' : '0').repeat(q);
-        }
-        // 7ビット厳密チェック
-        return s.length === 7 ? s : null;
-      }
-
-      // ── 左6桁デコード（L/G判別でパリティも取得）──
-      let leftDigits = [], parity = '', pos = i + 3;
-      let valid = true;
-
-      for (let d = 0; d < 6; d++) {
-        // ユニット幅を都度再推定（左側runs全体の平均でドリフト補正）
-        let uLocal = uGuard;
-        if (d > 0) {
-          let totalW = 0, totalRuns = 0;
-          for (let j = i; j < pos; j++) { totalW += runs[j][1]; totalRuns++; }
-          // EAN左半=スタートガード3runs + 6桁×4runs = 27runs, 理論幅 = 3 + 6×7 = 45units
-          const theoryUnits = 3 + d * 7;
-          const actualRuns  = 3 + d * 4;
-          let sumW = 0;
-          for (let j = i; j < i + actualRuns && j < runs.length; j++) sumW += runs[j][1];
-          uLocal = sumW / theoryUnits;
-          if (uLocal < 0.5) uLocal = uGuard;
-        }
-
-        const b = runGroupTo7bit(pos, uLocal);
-        if (!b) { valid = false; break; }
-        const li = L.indexOf(b);
-        if (li !== -1) { leftDigits.push(li); parity += 'L'; }
-        else {
-          const gi = G.indexOf(b);
-          if (gi !== -1) { leftDigits.push(gi); parity += 'G'; }
-          else { valid = false; break; }
-        }
-        pos += 4;
-      }
-      if (!valid || leftDigits.length !== 6) continue;
-
-      const firstDigit = FIRST.indexOf(parity);
-      if (firstDigit === -1) continue;
-
-      // ── 中間ガード(5runs = 01010)確認 ──
-      let midStr = '';
-      for (let j = 0; j < 5; j++) {
-        if (pos + j >= runs.length) { valid = false; break; }
-        midStr += runs[pos + j][0] ? '1' : '0';
-      }
-      if (!valid || midStr !== '01010') continue;
-      pos += 5;
-
-      // ── 右6桁（R符号、ユニット幅を右半部から再推定）──
-      // 右半部理論幅: 6桁×7units + 終端ガード3units = 45units
-      // 実際のruns: 右6桁×4runs + 3runs = 27runs
-      let rightSumW = 0;
-      const rightRunCount = Math.min(27, runs.length - pos);
-      for (let j = 0; j < rightRunCount; j++) rightSumW += runs[pos + j][1];
-      const uRight = rightRunCount >= 27 ? rightSumW / 45 : uGuard;
-
-      let rightDigits = [];
-      for (let d = 0; d < 6; d++) {
-        const b = runGroupTo7bit(pos, uRight);
-        if (!b) { valid = false; break; }
-        const ri = R.indexOf(b);
-        if (ri === -1) { valid = false; break; }
-        rightDigits.push(ri);
-        pos += 4;
-      }
-      if (!valid || rightDigits.length !== 6) continue;
-
-      const allDigits = [firstDigit, ...leftDigits, ...rightDigits];
-
-      // ── チェックデジット検証 ──
-      let sum = 0;
-      for (let k = 0; k < 12; k++) sum += allDigits[k] * (k % 2 === 0 ? 1 : 3);
-      if ((10 - (sum % 10)) % 10 !== allDigits[12]) continue;
-
-      return allDigits.join('');
-    }
-    return null;
-  }
-
-  // VideoFrameをCanvas経由でデコード（getUserMedia用）
-  function decodeFrame(ctx, w, h) {
-    // 映像中央40%を密に走査（上下に広めにとってバーコードを捉えやすくする）
-    const rows = [];
-    for (let p = 0.35; p <= 0.65; p += 0.03) rows.push(Math.round(h * p));
-
-    const candidates = new Map();
-    for (const row of rows) {
-      if (row < 0 || row >= h) continue;
-      const d = ctx.getImageData(0, row, w, 1).data;
-      const gray = new Uint8Array(w);
-      for (let x = 0; x < w; x++) {
-        gray[x] = (d[x*4]*77 + d[x*4+1]*150 + d[x*4+2]*29) >> 8;
-      }
-      const r = decode(gray, w);
-      if (r) {
-        const cnt = (candidates.get(r) || 0) + 1;
-        candidates.set(r, cnt);
-        if (cnt >= 2) return r; // 2行一致で確定（誤読防止）
-      }
-    }
-    // 2行一致なしでも1件あれば採用
-    return candidates.size === 1 ? [...candidates.keys()][0] : null;
-  }
-
-  return { decodeFrame };
-})();
-
-// ── getUserMedia ライブスキャン ──
+// ── getUserMedia + BarcodeDetector ライブスキャン ──
 let scanEventType = 'bought';
 let isScanning    = false;
 let _stream       = null;
 let _rafId        = null;
-let _scanCanvas   = null;
-let _scanCtx      = null;
+let _detector     = null;
 
 function startScan(eventType) {
   if (isScanning) return;
   scanEventType = eventType;
-
-  // file:// では getUserMedia が使えないので input[capture] にフォールバック
-  if (location.protocol === 'file:') {
-    _startCaptureFallback();
-    return;
-  }
   _openCamera().catch(e => {
     console.log('カメラ起動失敗:', e.message);
     stopScan();
     showManualInput('', scanEventType);
-  });
-}
-
-// ── file:// 用フォールバック（input[capture]方式）──
-function _startCaptureFallback() {
-  let input = document.getElementById('_capture-input');
-  if (!input) {
-    input = document.createElement('input');
-    input.type = 'file';
-    input.id   = '_capture-input';
-    input.accept = 'image/*';
-    input.setAttribute('capture', 'environment');
-    input.style.display = 'none';
-    document.body.appendChild(input);
-  }
-  // 毎回新しいリスナーをセットするためcloneで置き換え
-  const fresh = input.cloneNode(false);
-  input.parentNode.replaceChild(fresh, input);
-  fresh.addEventListener('change', async (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (!file) return;
-    document.getElementById('scan-status').textContent = '読み取り中…';
-    document.getElementById('camera-overlay').style.display = 'flex';
-    isScanning = true;
-    try {
-      const barcode = await _decodeImageFile(file);
-      if (barcode) {
-        document.getElementById('scan-status').textContent = '商品情報を確認中…';
-        await handleBarcodeResult(barcode, scanEventType);
-      } else {
-        stopScan();
-        showManualInput('', scanEventType);
-      }
-    } catch(err) {
-      stopScan();
-      showManualInput('', scanEventType);
-    }
-  });
-  fresh.click();
-}
-
-// file:// フォールバック用の静止画デコード
-async function _decodeImageFile(file) {
-  return new Promise(resolve => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const MAX = 800;
-      let w = img.naturalWidth, h = img.naturalHeight;
-      if (Math.max(w,h) > MAX) { const s = MAX/Math.max(w,h); w=Math.round(w*s); h=Math.round(h*s); }
-      const cv = document.createElement('canvas');
-      cv.width = w; cv.height = h;
-      const ctx = cv.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(img, 0, 0, w, h);
-      img.src = '';
-      const result = EAN13.decodeFrame(ctx, w, h);
-      cv.width = 1;
-      resolve(result);
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
-    img.src = url;
   });
 }
 
@@ -1223,43 +979,40 @@ async function _openCamera() {
   video.srcObject = _stream;
   await video.play();
 
-  const vw = video.videoWidth  || 1280;
-  const vh = video.videoHeight || 720;
-  _scanCanvas = document.createElement('canvas');
-  _scanCanvas.width  = vw;
-  _scanCanvas.height = vh;
-  _scanCtx = _scanCanvas.getContext('2d', { willReadFrequently: true });
+  _detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8'] });
 
   document.getElementById('scan-status').textContent = 'バーコードを枠に合わせてください';
   _rafId = requestAnimationFrame(() => _scanLoop(video));
 }
 
-let _lastScanTime = 0;
-
 function _scanLoop(video) {
-  if (!isScanning || !_scanCtx || !_scanCanvas) return;
+  if (!isScanning) return;
 
-  const now = performance.now();
-  if (now - _lastScanTime >= 150) { // 150ms間隔でデコード（約6fps）
-    _lastScanTime = now;
-    _scanCtx.drawImage(video, 0, 0, _scanCanvas.width, _scanCanvas.height);
-    const barcode = EAN13.decodeFrame(_scanCtx, _scanCanvas.width, _scanCanvas.height);
+  _detector.detect(video)
+    .then(results => {
+      if (!isScanning) return;
+      const hit = results.find(r => r.rawValue && r.rawValue.length === 13);
+      if (hit) {
+        _onBarcodeFound(hit.rawValue);
+      } else {
+        _rafId = requestAnimationFrame(() => _scanLoop(video));
+      }
+    })
+    .catch(() => {
+      if (isScanning) _rafId = requestAnimationFrame(() => _scanLoop(video));
+    });
+}
 
-    if (barcode) {
-      console.log('スキャン成功:', barcode);
-      cancelAnimationFrame(_rafId); _rafId = null;
-      if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
-      const video2 = document.getElementById('scan-video');
-      if (video2) video2.srcObject = null;
-      _scanCanvas = null; _scanCtx = null;
-      isScanning = false;
-      document.getElementById('scan-status').textContent = '商品情報を確認中…';
-      handleBarcodeResult(barcode, scanEventType);
-      return;
-    }
-  }
-
-  _rafId = requestAnimationFrame(() => _scanLoop(video));
+function _onBarcodeFound(barcode) {
+  console.log('スキャン成功:', barcode);
+  if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+  if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
+  const v = document.getElementById('scan-video');
+  if (v) v.srcObject = null;
+  _detector  = null;
+  isScanning = false;
+  document.getElementById('scan-status').textContent = '商品情報を確認中…';
+  handleBarcodeResult(barcode, scanEventType);
 }
 
 function fallbackManual() {
@@ -1271,10 +1024,9 @@ function stopScan() {
   isScanning = false;
   if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
   if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
-  const video = document.getElementById('scan-video');
-  if (video) video.srcObject = null;
-  _scanCanvas = null;
-  _scanCtx    = null;
+  const v = document.getElementById('scan-video');
+  if (v) v.srcObject = null;
+  _detector = null;
   document.getElementById('camera-overlay').style.display = 'none';
 }
 
